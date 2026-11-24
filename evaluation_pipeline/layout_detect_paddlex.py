@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -30,6 +31,11 @@ REGION_FIELDS = (
     "bbox_2d",
     "polygon",
     "task_type",
+)
+DEFAULT_POLYGON_SCHEMA = "normalized four-point bbox rectangle"
+PRESERVED_POLYGON_SCHEMA = (
+    "clipped detector polygon_points normalized as floats in [0, 1000] "
+    "(falls back to 4-point bbox rectangle)"
 )
 
 LABEL_TASK_MAPPING = {
@@ -94,7 +100,169 @@ def extract_boxes(result: Any) -> list[dict[str, Any]]:
     return []
 
 
-def serialize_regions(result: Any, image_width: int, image_height: int) -> list[dict[str, Any]]:
+def _polygon_shoelace_area(points: list[list[float]] | list[tuple[float, float]]) -> float:
+    area = 0.0
+    n = len(points)
+    for idx in range(n):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % n]
+        area += x1 * y2 - x2 * y1
+    return 0.5 * abs(area)
+
+
+def _clip_polygon_to_page_rect(
+    pts: list[tuple[float, float]],
+    width: float,
+    height: float,
+) -> list[tuple[float, float]]:
+    """Clip an ordered 2D contour against `[0, width] x [0, height]` via Sutherland-Hodgman."""
+    poly = list(pts)
+    if len(poly) < 3 or width <= 0.0 or height <= 0.0:
+        return []
+
+    def _inside(p: tuple[float, float], kind: str, bound: float) -> bool:
+        if kind == "x_min":
+            return p[0] >= bound
+        if kind == "x_max":
+            return p[0] <= bound
+        if kind == "y_min":
+            return p[1] >= bound
+        return p[1] <= bound
+
+    def _intersect(
+        p1: tuple[float, float],
+        p2: tuple[float, float],
+        kind: str,
+        bound: float,
+    ) -> tuple[float, float] | None:
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        if kind in ("x_min", "x_max"):
+            if dx == 0.0 or not math.isfinite(dx):
+                return None
+            t = (bound - p1[0]) / dx
+            ix = bound
+            iy = p1[1] + t * dy
+        else:
+            if dy == 0.0 or not math.isfinite(dy):
+                return None
+            t = (bound - p1[1]) / dy
+            ix = p1[0] + t * dx
+            iy = bound
+        if not (math.isfinite(ix) and math.isfinite(iy)):
+            return None
+        return (ix, iy)
+
+    for kind, bound in (
+        ("x_min", 0.0),
+        ("x_max", float(width)),
+        ("y_min", 0.0),
+        ("y_max", float(height)),
+    ):
+        if not poly:
+            return []
+        clipped: list[tuple[float, float]] = []
+        prev = poly[-1]
+        prev_in = _inside(prev, kind, bound)
+        for curr in poly:
+            curr_in = _inside(curr, kind, bound)
+            if curr_in != prev_in:
+                inter = _intersect(prev, curr, kind, bound)
+                if inter is None:
+                    return []
+                clipped.append(inter)
+            if curr_in:
+                clipped.append(curr)
+            prev = curr
+            prev_in = curr_in
+        poly = clipped
+    return poly
+
+
+def _normalize_polygon_points(
+    raw_polygon: Any,
+    image_width: int,
+    image_height: int,
+    fallback: list[list[int]],
+) -> list[list[float]] | list[list[int]]:
+    """Clip and normalize an ordered 2D contour to float `[0, 1000]`, else return `fallback`."""
+    if raw_polygon is None or image_width <= 0 or image_height <= 0:
+        return fallback
+    raw_seq = raw_polygon
+    tolist = getattr(raw_seq, "tolist", None)
+    if callable(tolist):
+        try:
+            raw_seq = tolist()
+        except Exception:
+            return fallback
+    if not isinstance(raw_seq, (list, tuple)) or len(raw_seq) < 3:
+        return fallback
+
+    pts: list[tuple[float, float]] = []
+    for raw_pt in raw_seq:
+        pt = raw_pt
+        pt_tolist = getattr(pt, "tolist", None)
+        if callable(pt_tolist):
+            try:
+                pt = pt_tolist()
+            except Exception:
+                return fallback
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            return fallback
+        if isinstance(pt[0], (bool, np.bool_)) or isinstance(pt[1], (bool, np.bool_)):
+            return fallback
+        try:
+            px = float(pt[0])
+            py = float(pt[1])
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return fallback
+        pts.append((px, py))
+
+    clipped = _clip_polygon_to_page_rect(pts, float(image_width), float(image_height))
+    if len(clipped) < 3:
+        return fallback
+
+    dedup: list[tuple[float, float]] = []
+    for px, py in clipped:
+        if not dedup or abs(px - dedup[-1][0]) > 1e-9 or abs(py - dedup[-1][1]) > 1e-9:
+            dedup.append((px, py))
+    if len(dedup) >= 2 and abs(dedup[0][0] - dedup[-1][0]) <= 1e-9 and abs(dedup[0][1] - dedup[-1][1]) <= 1e-9:
+        dedup.pop()
+    if len(dedup) < 3:
+        return fallback
+    area = _polygon_shoelace_area(dedup)
+    if not (math.isfinite(area) and area > 1e-9):
+        return fallback
+
+    inv_w = 1000.0 / float(image_width)
+    inv_h = 1000.0 / float(image_height)
+    norm_pts: list[list[float]] = []
+    for px, py in dedup:
+        nx = px * inv_w
+        ny = py * inv_h
+        if not (math.isfinite(nx) and math.isfinite(ny)):
+            return fallback
+        pt_norm = [max(0.0, min(1000.0, nx)), max(0.0, min(1000.0, ny))]
+        if not norm_pts or pt_norm != norm_pts[-1]:
+            norm_pts.append(pt_norm)
+    if len(norm_pts) >= 2 and norm_pts[0] == norm_pts[-1]:
+        norm_pts.pop()
+    if len(norm_pts) < 3:
+        return fallback
+    norm_area = _polygon_shoelace_area(norm_pts)
+    if not (math.isfinite(norm_area) and norm_area > 0.0):
+        return fallback
+    return norm_pts
+
+
+def serialize_regions(
+    result: Any,
+    image_width: int,
+    image_height: int,
+    preserve_polygon: bool = False,
+) -> list[dict[str, Any]]:
     regions = []
     for box in extract_boxes(result):
         label = str(box.get("label", ""))
@@ -118,17 +286,28 @@ def serialize_regions(result: Any, image_width: int, image_height: int) -> list[
             int(y2 / image_height * 1000),
         ]
         x1_normalized, y1_normalized, x2_normalized, y2_normalized = bbox_2d
+        fallback_polygon = [
+            [x1_normalized, y1_normalized],
+            [x2_normalized, y1_normalized],
+            [x2_normalized, y2_normalized],
+            [x1_normalized, y2_normalized],
+        ]
+        polygon = (
+            _normalize_polygon_points(
+                box.get("polygon_points"),
+                image_width,
+                image_height,
+                fallback_polygon,
+            )
+            if preserve_polygon
+            else fallback_polygon
+        )
         regions.append({
             "index": len(regions),
             "label": label,
             "score": float(box.get("score", 0.0)),
             "bbox_2d": bbox_2d,
-            "polygon": [
-                [x1_normalized, y1_normalized],
-                [x2_normalized, y1_normalized],
-                [x2_normalized, y2_normalized],
-                [x1_normalized, y2_normalized],
-            ],
+            "polygon": polygon,
             "task_type": task_type,
         })
     return regions
@@ -160,6 +339,7 @@ def worker_main(
     batch_size: int,
     items: list[tuple[int, str]],
     result_queue: mp.Queue,
+    preserve_polygon: bool = False,
 ) -> None:
     try:
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -192,7 +372,11 @@ def worker_main(
                     f"PaddleX result count {len(results)} != image count {len(images)}"
                 )
             for index, image, result in zip(indices, images, results):
-                regions = serialize_regions(result, *image.size)
+                regions = serialize_regions(
+                    result,
+                    *image.size,
+                    preserve_polygon=preserve_polygon,
+                )
                 result_queue.put(("result", index, list(image.size), regions))
             for image in images:
                 image.close()
@@ -217,7 +401,7 @@ def parse_gpu_ids(value: str) -> list[int]:
     return gpu_ids
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PaddleX PP-DocLayoutV3 multi-GPU layout inference",
     )
@@ -228,7 +412,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--flush_every", type=int, default=100)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--preserve_polygon",
+        action="store_true",
+        help=(
+            "Export clipped detector polygon_points normalized to [0, 1000] "
+            "(falls back to 4-point bbox rectangle)"
+        ),
+    )
+    args = parser.parse_args(argv)
     if not 0.0 <= args.threshold <= 1.0:
         parser.error("--threshold must be in [0, 1]")
     if args.batch_size < 1:
@@ -242,16 +434,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = parse_args()
-    if args.model_dir is not None and not Path(args.model_dir).is_dir():
-        raise SystemExit(f"[FAIL] PaddleX model directory not found: {args.model_dir}")
-
-    dataset = load_jsonl(args.input_jsonl)
-    output_path = Path(args.output_jsonl)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
-    manifest = {
+def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    polygon_schema = (
+        PRESERVED_POLYGON_SCHEMA
+        if getattr(args, "preserve_polygon", False)
+        else DEFAULT_POLYGON_SCHEMA
+    )
+    return {
         "layout_backend": "paddlex",
         "layout_model": args.model_dir,
         "layout_threshold": args.threshold,
@@ -264,10 +453,17 @@ def main() -> None:
             "top_level": "input fields + layout_result",
             "region_fields": list(REGION_FIELDS),
             "bbox_coordinates": "normalized integers in [0, 1000]",
-            "polygon": "normalized four-point bbox rectangle",
+            "polygon": polygon_schema,
         },
         "label_task_mapping": LABEL_TASK_MAPPING,
     }
+
+
+def validate_or_write_manifest(
+    output_path: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+) -> None:
     if output_path.exists() and output_path.stat().st_size > 0:
         if not manifest_path.is_file():
             raise SystemExit(
@@ -301,6 +497,19 @@ def main() -> None:
         )
         os.replace(temporary_manifest, manifest_path)
 
+
+def main() -> None:
+    args = parse_args()
+    if args.model_dir is not None and not Path(args.model_dir).is_dir():
+        raise SystemExit(f"[FAIL] PaddleX model directory not found: {args.model_dir}")
+
+    dataset = load_jsonl(args.input_jsonl)
+    output_path = Path(args.output_jsonl)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
+    manifest = build_manifest(args)
+    validate_or_write_manifest(output_path, manifest_path, manifest)
+
     completed_paths = set()
     if output_path.exists():
         for row in load_jsonl(str(output_path)):
@@ -317,6 +526,8 @@ def main() -> None:
     print(f"To process: {len(todo)}")
     print(f"PaddleX GPUs: {args.gpu_ids}")
     print(f"Threshold: {args.threshold}")
+    if args.preserve_polygon:
+        print("Preserve polygon: True")
     if not todo:
         print("Nothing to process.")
         return
@@ -339,6 +550,7 @@ def main() -> None:
                 args.batch_size,
                 shard,
                 result_queue,
+                args.preserve_polygon,
             ),
         )
         process.start()
